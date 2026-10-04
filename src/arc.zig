@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -13,16 +14,16 @@ pub fn LockRefArenaArc(comptime T: type) type {
     // Thus, Args, more or less, FullArgs[1..], but we can't just do FullArgs[1..]
     // we need to build a new Struct.
     const FullArgs = std.meta.ArgsTuple(@TypeOf(T.init));
-    const full_fields = std.meta.fields(FullArgs);
+    const full_fields = @typeInfo(FullArgs).@"struct".field_types;
     const ARG_COUNT = full_fields.len;
 
-    if (ARG_COUNT == 0 or full_fields[0].type != std.mem.Allocator) {
+    if (ARG_COUNT == 0 or full_fields[0] != std.mem.Allocator) {
         @compileError("The first argument to " ++ @typeName(T) ++ ".init must be an std.mem.Allocator");
     }
 
     var arg_fields: [full_fields.len - 1]type = undefined;
-    inline for (full_fields[1..], 0..) |field, index| {
-        arg_fields[index] = field.type;
+    inline for (full_fields[1..], 0..) |field_type, index| {
+        arg_fields[index] = field_type;
     }
 
     const Args = @Tuple(
@@ -32,19 +33,21 @@ pub fn LockRefArenaArc(comptime T: type) type {
     return struct {
         arc: *Arc,
         allocator: Allocator,
-        mutex: std.Thread.Mutex,
+        mutex: Io.Mutex,
+        io: Io,
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, args: Args) !Self {
+        pub fn init(io: Io, allocator: Allocator, args: Args) !Self {
             return .{
-                .mutex = .{},
+                .mutex = .init,
                 .allocator = allocator,
                 .arc = try createArc(allocator, args),
+                .io = io,
             };
         }
 
-        pub fn initWithValue(allocator: Allocator, value: T) !Self {
+        pub fn initWithValue(io: Io, allocator: Allocator, value: T) !Self {
             const arena = try allocator.create(ArenaAllocator);
             errdefer allocator.destroy(arena);
 
@@ -60,20 +63,21 @@ pub fn LockRefArenaArc(comptime T: type) type {
 
             return .{
                 .arc = arc,
-                .mutex = .{},
+                .mutex = .init,
                 .allocator = allocator,
+                .io = io,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.arc.release();
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
         }
 
         pub fn acquire(self: *Self) *Arc {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             var arc = self.arc;
             arc.acquire();
             return arc;
@@ -81,10 +85,10 @@ pub fn LockRefArenaArc(comptime T: type) type {
 
         pub fn setValue(self: *Self, args: Args) !void {
             const arc = try createArc(self.allocator, args);
-            self.mutex.lock();
+            try self.mutex.lock(self.io);
             var existing = self.arc;
             self.arc = arc;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             existing.release();
         }
 
@@ -151,27 +155,29 @@ pub fn LockRefArc(comptime T: type) type {
     return struct {
         arc: *Arc,
         allocator: Allocator,
-        mutex: std.Thread.Mutex,
+        mutex: Io.Mutex,
+        io: Io,
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator, value: T) !Self {
+        pub fn init(io: Io, allocator: Allocator, value: T) !Self {
             return .{
-                .mutex = .{},
+                .mutex = .init,
                 .allocator = allocator,
                 .arc = try createArc(allocator, value),
+                .io = io,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
             self.arc.release();
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
         }
 
         pub fn acquire(self: *Self) *Arc {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             var arc = self.arc;
             arc.acquire();
             return arc;
@@ -179,10 +185,10 @@ pub fn LockRefArc(comptime T: type) type {
 
         pub fn setValue(self: *Self, value: T) !void {
             const arc = try createArc(self.allocator, value);
-            self.mutex.lock();
+            try self.mutex.lock(self.io);
             var existing = self.arc;
             self.arc = arc;
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             existing.release();
         }
 
@@ -230,11 +236,11 @@ pub fn LockRefArc(comptime T: type) type {
 const t = @import("zul.zig").testing;
 test "LockRefArenaArc" {
     {
-        var ref = try LockRefArenaArc(TestArenaValue).init(t.allocator, .{"test"});
+        var ref = try LockRefArenaArc(TestArenaValue).init(t.io, t.allocator, .{"test"});
         ref.deinit();
     }
 
-    var ref = try LockRefArenaArc(TestArenaValue).init(t.allocator, .{"hello"});
+    var ref = try LockRefArenaArc(TestArenaValue).init(t.io, t.allocator, .{"hello"});
     defer ref.deinit();
 
     // keep this one around and re-test it at the end, it should still be valid
@@ -256,7 +262,7 @@ test "LockRefArenaArc" {
 }
 
 test "LockRefArenaArc: initWithValue" {
-    var ref = try LockRefArenaArc(TestArenaValue).initWithValue(t.allocator, .{ .str = "teg" });
+    var ref = try LockRefArenaArc(TestArenaValue).initWithValue(t.io, t.allocator, .{ .str = "teg" });
     defer ref.deinit();
 
     const arc1 = ref.acquire();
@@ -266,11 +272,11 @@ test "LockRefArenaArc: initWithValue" {
 
 test "LockRefArc" {
     {
-        var ref = try LockRefArc(TestValue).init(t.allocator, .{ .str = "test" });
+        var ref = try LockRefArc(TestValue).init(t.io, t.allocator, .{ .str = "test" });
         ref.deinit();
     }
 
-    var ref = try LockRefArc(TestValue).init(t.allocator, .{ .str = "hello" });
+    var ref = try LockRefArc(TestValue).init(t.io, t.allocator, .{ .str = "hello" });
     defer ref.deinit();
 
     // keep this one around and re-test it at the end, it should still be valid

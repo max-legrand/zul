@@ -68,9 +68,11 @@ pub const time = struct {
                 return value.toEpoch();
             },
             else => {
-                const ts = posix.clock_gettime(.REALTIME) catch |err| switch (err) {
-                    error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
-                };
+                var ts: posix.timespec = undefined;
+                switch (posix.errno(posix.system.clock_gettime(.REALTIME, &ts))) {
+                    .SUCCESS => {},
+                    else => return 0, // "Precision of timing depends on hardware and OS".
+                }
                 return (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec;
             },
         }

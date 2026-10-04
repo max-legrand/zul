@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -16,12 +17,14 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
     return struct {
         queue: Q,
         running: bool,
-        mutex: Thread.Mutex,
-        cond: Thread.Condition,
+        mutex: Io.Mutex,
+        cond: Io.Condition,
         thread: ?Thread,
+        io: Io,
+        allocator: Allocator,
 
         const Q = std.PriorityQueue(Job(T), void, compare);
-        const include_scheduler = @typeInfo(@TypeOf(T.run)).@"fn".params.len == 4;
+        const include_scheduler = @typeInfo(@TypeOf(T.run)).@"fn".param_types.len == 4;
 
         fn compare(_: void, a: Job(T), b: Job(T)) std.math.Order {
             return std.math.order(a.at, b.at);
@@ -29,25 +32,27 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: Allocator) Self {
+        pub fn init(io: Io, allocator: Allocator) Self {
             return .{
-                .cond = .{},
-                .mutex = .{},
+                .cond = .init,
+                .mutex = .init,
                 .thread = null,
                 .running = false,
-                .queue = Q.init(allocator, {}),
+                .queue = .empty,
+                .io = io,
+                .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
             self.stop();
-            self.queue.deinit();
+            self.queue.deinit(self.allocator);
         }
 
         pub fn start(self: *Self, ctx: C) !void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 if (self.running == true) {
                     return error.AlreadyRunning;
                 }
@@ -58,15 +63,15 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
 
         pub fn stop(self: *Self) void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 if (self.running == false) {
                     return;
                 }
                 self.running = false;
             }
 
-            self.cond.signal();
+            self.cond.signal(self.io);
             self.thread.?.join();
         }
 
@@ -86,8 +91,8 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
 
             var reschedule = false;
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
 
                 if (self.queue.peek()) |*next| {
                     if (at < next.at) {
@@ -96,20 +101,20 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
                 } else {
                     reschedule = true;
                 }
-                try self.queue.add(job);
+                try self.queue.push(self.allocator, job);
             }
 
             if (reschedule) {
                 // Our new job is scheduled before our previous earlier job
                 // (or we had no previous jobs)
                 // We need to reset our schedule
-                self.cond.signal();
+                self.cond.signal(self.io);
             }
         }
 
         // this is running in a separate thread, started by start()
         fn run(self: *Self, ctx: C) void {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.io);
 
             while (true) {
                 const ms_until_next = self.processPending(ctx);
@@ -117,18 +122,21 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
                 // mutex is locked when returning for processPending
 
                 if (self.running == false) {
-                    self.mutex.unlock();
+                    self.mutex.unlock(self.io);
                     return;
                 }
 
                 if (ms_until_next) |timeout| {
-                    const ns = @as(u64, @intCast(timeout * std.time.ns_per_ms));
-                    self.cond.timedWait(&self.mutex, ns) catch |err| {
-                        std.debug.assert(err == error.Timeout);
+                    const timeout_duration: Io.Timeout = .{ .duration = .{
+                        .raw = .fromMilliseconds(timeout),
+                        .clock = .real,
+                    } };
+                    self.cond.waitTimeout(self.io, &self.mutex, timeout_duration) catch |err| switch (err) {
                         // on success or error, cond locks mutex, which is what we want
+                        error.Timeout, error.Canceled => {},
                     };
                 } else {
-                    self.cond.wait(&self.mutex);
+                    self.cond.waitUncancelable(self.io, &self.mutex);
                 }
                 // if we woke up, it's because a new job was added with a more recent
                 // scheduled time. This new job MAY not be ready to run yet, and
@@ -153,9 +161,9 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
                 }
 
                 // delete the peeked job from the queue, because we're going to process it
-                const job = self.queue.remove();
-                self.mutex.unlock();
-                defer self.mutex.lock();
+                const job = self.queue.pop().?;
+                self.mutex.unlock(self.io);
+                defer self.mutex.lockUncancelable(self.io);
                 if (comptime include_scheduler) {
                     job.task.run(ctx, self, next.at);
                 } else {
@@ -168,7 +176,7 @@ pub fn Scheduler(comptime T: type, comptime C: type) type {
 
 const t = @import("zul.zig").testing;
 test "Scheduler: null context" {
-    var s = Scheduler(TestTask, void).init(t.allocator);
+    var s = Scheduler(TestTask, void).init(t.io, t.allocator);
     defer s.deinit();
 
     try s.start({});
@@ -204,7 +212,7 @@ test "Scheduler: null context" {
 }
 
 test "Scheduler: with context" {
-    var s = Scheduler(TestCtxTask, *usize).init(t.allocator);
+    var s = Scheduler(TestCtxTask, *usize).init(t.io, t.allocator);
     defer s.deinit();
 
     var ctx: usize = 3;

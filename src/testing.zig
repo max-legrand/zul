@@ -17,8 +17,8 @@ pub fn expectEqual(expected: anytype, actual: anytype) !void {
             return expectStrings(expected, actual);
         },
         .@"struct" => |structType| {
-            inline for (structType.fields) |field| {
-                try expectEqual(@field(expected, field.name), @field(actual, field.name));
+            inline for (structType.field_names) |field_name| {
+                try expectEqual(@field(expected, field_name), @field(actual, field_name));
             }
             return;
         },
@@ -32,9 +32,9 @@ pub fn expectEqual(expected: anytype, actual: anytype) !void {
             const actualTag = @as(Tag, actual);
             try expectEqual(expectedTag, actualTag);
 
-            inline for (std.meta.fields(@TypeOf(actual))) |fld| {
-                if (std.mem.eql(u8, fld.name, @tagName(actualTag))) {
-                    try expectEqual(@field(expected, fld.name), @field(actual, fld.name));
+            inline for (union_info.field_names) |field_name| {
+                if (std.mem.eql(u8, field_name, @tagName(actualTag))) {
+                    try expectEqual(@field(expected, field_name), @field(actual, field_name));
                     return;
                 }
             }
@@ -158,7 +158,7 @@ pub const Random = struct {
     pub fn random() std.Random {
         if (instance == null) {
             var seed: u64 = undefined;
-            std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+            io.random(std.mem.asBytes(&seed));
             instance = std.Random.DefaultPrng.init(seed);
         }
         return instance.?.random();

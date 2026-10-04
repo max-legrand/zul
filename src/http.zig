@@ -163,7 +163,7 @@ pub const Request = struct {
 
         self._req = try self._client.request(self.method, uri, .{
             .extra_headers = self.headers.items,
-            .redirect_behavior = if (have_body) .not_allowed else @enumFromInt(5),
+            .redirect_behavior = if (have_body) .not_allowed else @fromBackingInt(@intCast(5)),
         });
         var req = &self._req.?;
 
@@ -204,7 +204,10 @@ pub const Request = struct {
 
                 var written: usize = 0;
                 while (true) {
-                    const n = try f.readStreaming(self._io, &.{&buf});
+                    const n = f.readStreaming(self._io, &.{&buf}) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
                     if (n == 0) {
                         break;
                     }
@@ -236,7 +239,7 @@ pub const Request = struct {
             .req = req,
             .res = res,
             .headers = headers,
-            .status = @intFromEnum(res.head.status),
+            .status = @backingInt(res.head.status),
         };
     }
 };
@@ -750,7 +753,7 @@ fn startTestServer() !std.Thread {
 
                 var transfer_buffer: [64]u8 = undefined;
                 const body_reader = server.reader.bodyReader(&transfer_buffer, .none, content_length);
-                const req_body = try body_reader.allocRemaining(allocator, @enumFromInt(16_384));
+                const req_body = try body_reader.allocRemaining(allocator, @fromBackingInt(@intCast(16_384)));
                 const res = try std.json.Stringify.valueAlloc(allocator, .{
                     .url = req.head.target,
                     .method = req.head.method,
